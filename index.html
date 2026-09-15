@@ -1,59 +1,185 @@
-<div>Teachable Machine Image Model</div>
-<button type="button" onclick="init()">Start</button>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Driver Drowsiness Alert</title>
+<style>
+  body {
+    font-family: system-ui, sans-serif;
+    background: #0f172a;
+    color: #e2e8f0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 24px;
+  }
+  h1 { font-size: 1.3rem; margin-bottom: 4px; }
+  p.sub { color: #94a3b8; margin-top: 0; font-size: 0.9rem; }
+  #webcam-container { margin: 16px 0; border-radius: 12px; overflow: hidden; box-shadow: 0 0 0 3px #1e293b; }
+  #label-container { font-size: 1.1rem; margin-top: 8px; min-height: 60px; }
+  .label-row { display: flex; justify-content: space-between; width: 320px; padding: 4px 0; }
+  #status {
+    font-size: 1.4rem;
+    font-weight: 700;
+    padding: 14px 24px;
+    border-radius: 10px;
+    margin-top: 12px;
+    transition: background 0.2s;
+    background: #1e293b;
+  }
+  #status.alert {
+    background: #dc2626;
+    animation: pulse 0.6s infinite alternate;
+  }
+  @keyframes pulse {
+    from { box-shadow: 0 0 0px 0px rgba(220,38,38,0.6); }
+    to   { box-shadow: 0 0 25px 10px rgba(220,38,38,0.6); }
+  }
+  button {
+    background: #2563eb;
+    color: white;
+    border: none;
+    padding: 10px 18px;
+    border-radius: 8px;
+    font-size: 1rem;
+    cursor: pointer;
+    margin-top: 10px;
+  }
+  button:hover { background: #1d4ed8; }
+  #config {
+    font-size: 0.8rem;
+    color: #94a3b8;
+    margin-top: 20px;
+    max-width: 340px;
+    text-align: center;
+  }
+</style>
+</head>
+<body>
+
+<h1>🚗 Driver Drowsiness Alert</h1>
+<p class="sub">Runs your Teachable Machine model live in the browser</p>
+
+<button id="start-btn">Start Camera</button>
 <div id="webcam-container"></div>
 <div id="label-container"></div>
-<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@latest/dist/tf.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@teachablemachine/image@latest/dist/teachablemachine-image.min.js"></script>
-<script type="text/javascript">
-    // More API functions here:
-    // https://github.com/googlecreativelab/teachablemachine-community/tree/master/libraries/image
+<div id="status">Waiting to start…</div>
 
-    // the link to your model provided by Teachable Machine export panel
-    const URL = "./my_model/";
+<div id="config">
+  Edit the <code>MODEL_URL</code> and <code>CLOSED_CLASS_NAME</code> constants
+  in the script below to match your exported Teachable Machine model.
+</div>
 
-    let model, webcam, labelContainer, maxPredictions;
+<!-- Teachable Machine + TensorFlow.js libraries -->
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@1.3.1/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@teachablemachine/image@0.8/dist/teachablemachine-image.min.js"></script>
 
-    // Load the image model and setup the webcam
-    async function init() {
-        const modelURL = URL + "model.json";
-        const metadataURL = URL + "metadata.json";
+<script>
+  // ====== CONFIG — EDIT THESE ======
+  // Paste the URL you get from Teachable Machine's "Upload my model" export option.
+  // It should look like: https://teachablemachine.withgoogle.com/models/XXXXXXXXX/
+  const MODEL_URL = "https://teachablemachine.withgoogle.com/models/XXXXXXXXX/";
 
-        // load the model and metadata
-        // Refer to tmImage.loadFromFiles() in the API to support files from a file picker
-        // or files from your local hard drive
-        // Note: the pose library adds "tmImage" object to your window (window.tmImage)
-        model = await tmImage.load(modelURL, metadataURL);
-        maxPredictions = model.getTotalClasses();
+  // Exact class name you used for the "eyes closed" class in Teachable Machine
+  const CLOSED_CLASS_NAME = "Closed";
 
-        // Convenience function to setup a webcam
-        const flip = true; // whether to flip the webcam
-        webcam = new tmImage.Webcam(200, 200, flip); // width, height, flip
-        await webcam.setup(); // request access to the webcam
-        await webcam.play();
-        window.requestAnimationFrame(loop);
+  // How confident the model must be to count a frame as "closed"
+  const CONFIDENCE_THRESHOLD = 0.75;
 
-        // append elements to the DOM
-        document.getElementById("webcam-container").appendChild(webcam.canvas);
-        labelContainer = document.getElementById("label-container");
-        for (let i = 0; i < maxPredictions; i++) { // and class labels
-            labelContainer.appendChild(document.createElement("div"));
-        }
+  // How many consecutive "closed" frames before the alert fires (avoids false alarms from blinks)
+  const CONSECUTIVE_FRAMES_NEEDED = 15; // ~ a couple seconds depending on prediction speed
+  // ==================================
+
+  let model, webcam, labelContainer, maxPredictions;
+  let closedStreak = 0;
+  let audioCtx;
+
+  async function init() {
+    document.getElementById("start-btn").disabled = true;
+    document.getElementById("status").innerText = "Loading model…";
+
+    const modelURL = MODEL_URL + "model.json";
+    const metadataURL = MODEL_URL + "metadata.json";
+
+    model = await tmImage.load(modelURL, metadataURL);
+    maxPredictions = model.getTotalClasses();
+
+    const flip = true;
+    webcam = new tmImage.Webcam(320, 320, flip);
+    await webcam.setup();
+    await webcam.play();
+    window.requestAnimationFrame(loop);
+
+    document.getElementById("webcam-container").innerHTML = "";
+    document.getElementById("webcam-container").appendChild(webcam.canvas);
+
+    labelContainer = document.getElementById("label-container");
+    labelContainer.innerHTML = "";
+    for (let i = 0; i < maxPredictions; i++) {
+      const row = document.createElement("div");
+      row.className = "label-row";
+      labelContainer.appendChild(row);
     }
 
-    async function loop() {
-        webcam.update(); // update the webcam frame
-        await predict();
-        window.requestAnimationFrame(loop);
+    document.getElementById("status").innerText = "Monitoring…";
+  }
+
+  async function loop() {
+    webcam.update();
+    await predict();
+    window.requestAnimationFrame(loop);
+  }
+
+  async function predict() {
+    const prediction = await model.predict(webcam.canvas);
+    let closedConfidence = 0;
+
+    for (let i = 0; i < maxPredictions; i++) {
+      const p = prediction[i];
+      const row = labelContainer.childNodes[i];
+      row.innerText = `${p.className}: ${(p.probability * 100).toFixed(1)}%`;
+
+      if (p.className === CLOSED_CLASS_NAME) {
+        closedConfidence = p.probability;
+      }
     }
 
-    // run the webcam image through the image model
-    async function predict() {
-        // predict can take in an image, video or canvas html element
-        const prediction = await model.predict(webcam.canvas);
-        for (let i = 0; i < maxPredictions; i++) {
-            const classPrediction =
-                prediction[i].className + ": " + prediction[i].probability.toFixed(2);
-            labelContainer.childNodes[i].innerHTML = classPrediction;
-        }
+    const statusEl = document.getElementById("status");
+
+    if (closedConfidence >= CONFIDENCE_THRESHOLD) {
+      closedStreak++;
+    } else {
+      closedStreak = 0;
+      statusEl.classList.remove("alert");
+      statusEl.innerText = "Monitoring… eyes open";
     }
+
+    if (closedStreak >= CONSECUTIVE_FRAMES_NEEDED) {
+      triggerAlert();
+      statusEl.innerText = "⚠️ DROWSINESS DETECTED ⚠️";
+      statusEl.classList.add("alert");
+    }
+  }
+
+  function triggerAlert() {
+    // Beep using the Web Audio API (no external sound file needed)
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = "square";
+    osc.frequency.value = 880;
+    gain.gain.value = 0.15;
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + 0.3);
+
+    // Also try the browser vibration API (works on some mobile browsers)
+    if (navigator.vibrate) navigator.vibrate([200, 100, 200]);
+  }
+
+  document.getElementById("start-btn").addEventListener("click", init);
 </script>
+
+</body>
+</html>
