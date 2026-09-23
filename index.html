@@ -15,7 +15,34 @@
   }
   h1 { font-size: 1.3rem; margin-bottom: 4px; }
   p.sub { color: #94a3b8; margin-top: 0; font-size: 0.9rem; }
-  #webcam-container { margin: 16px 0; border-radius: 12px; overflow: hidden; box-shadow: 0 0 0 3px #1e293b; }
+  .video-row {
+    display: flex;
+    gap: 16px;
+    align-items: flex-start;
+    margin: 16px 0;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+  .video-box {
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: 0 0 0 3px #1e293b;
+    background: #000;
+  }
+  #video {
+    transform: scaleX(-1); /* mirror so it feels natural, like a selfie cam */
+    display: block;
+  }
+  #eye-crop-canvas {
+    display: block;
+    image-rendering: pixelated;
+  }
+  .box-label {
+    text-align: center;
+    font-size: 0.75rem;
+    color: #94a3b8;
+    margin-top: 4px;
+  }
   #label-container { font-size: 1.1rem; margin-top: 8px; min-height: 60px; }
   .label-row { display: flex; justify-content: space-between; width: 320px; padding: 4px 0; }
   #status {
@@ -26,6 +53,7 @@
     margin-top: 12px;
     transition: background 0.2s;
     background: #1e293b;
+    text-align: center;
   }
   #status.alert {
     background: #dc2626;
@@ -50,7 +78,7 @@
     font-size: 0.8rem;
     color: #94a3b8;
     margin-top: 20px;
-    max-width: 340px;
+    max-width: 380px;
     text-align: center;
   }
 </style>
@@ -58,60 +86,84 @@
 <body>
 
 <h1>🚗 Driver Drowsiness Alert</h1>
-<p class="sub">Runs your Teachable Machine model live in the browser</p>
+<p class="sub">Runs your Teachable Machine model live in the browser — now with automatic eye localization</p>
 
 <button id="start-btn">Start Camera</button>
-<div id="webcam-container"></div>
+
+<div class="video-row">
+  <div>
+    <div class="video-box"><video id="video" width="320" height="240" autoplay playsinline muted></video></div>
+    <div class="box-label">Full camera view</div>
+  </div>
+  <div>
+    <div class="video-box"><canvas id="eye-crop-canvas" width="200" height="100"></canvas></div>
+    <div class="box-label">Cropped eye region (what the model sees)</div>
+  </div>
+</div>
+
 <div id="label-container"></div>
 <div id="status">Waiting to start…</div>
 
 <div id="config">
-  Edit the <code>https://teachablemachine.withgoogle.com/models/L5pI9jus3/</code> and <code>close eye</code> constants
-  in the script below to match your exported Teachable Machine model.
+  Edit <code>MODEL_URL</code> and <code>CLOSED_CLASS_NAME</code> below to match your
+  exported Teachable Machine model. Face detection runs first to find your eyes;
+  only that cropped region is sent to your model — so re-train your Teachable
+  Machine model using similarly cropped eye images for best accuracy.
 </div>
 
-<!-- Teachable Machine + TensorFlow.js libraries -->
+<!-- Teachable Machine (TensorFlow.js) for the trained image classifier -->
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@1.3.1/dist/tf.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@teachablemachine/image@0.8/dist/teachablemachine-image.min.js"></script>
 
-<script>
+<script type="module">
+  // MediaPipe Face Landmarker — used only to locate the eyes, not to classify anything
+  import { FaceLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
   // ====== CONFIG — EDIT THESE ======
-  // Paste the URL you get from Teachable Machine's "Upload my model" export option.
-  // It should look like: https://teachablemachine.withgoogle.com/models/XXXXXXXXX/
-  const MODEL_URL = "https://teachablemachine.withgoogle.com/models/L5pI9jus3/";
-
-  // Exact class name you used for the "eyes closed" class in Teachable Machine
-  const CLOSED_CLASS_NAME = "Close eye";
-
-  // How confident the model must be to count a frame as "closed"
+  const MODEL_URL = "https://teachablemachine.withgoogle.com/models/XXXXXXXXX/";
+  const CLOSED_CLASS_NAME = "Closed";
   const CONFIDENCE_THRESHOLD = 0.75;
+  const CONSECUTIVE_FRAMES_NEEDED = 15;
 
-  // How many consecutive "closed" frames before the alert fires (avoids false alarms from blinks)
-  const CONSECUTIVE_FRAMES_NEEDED = 15; // ~ a couple seconds depending on prediction speed
+  // How much extra space to include around the detected eye area (bigger = looser crop)
+  const CROP_PADDING_FACTOR = 0.6;
   // ==================================
 
-  let model, webcam, labelContainer, maxPredictions;
+  // Landmark indices around the left and right eyes (MediaPipe's 478-point face mesh)
+  const LEFT_EYE = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246];
+  const RIGHT_EYE = [263, 249, 390, 373, 374, 380, 381, 382, 362, 398, 384, 385, 386, 387, 388, 466];
+  const ALL_EYE_POINTS = LEFT_EYE.concat(RIGHT_EYE);
+
+  let model, maxPredictions, labelContainer;
+  let faceLandmarker;
+  let video, eyeCanvas, eyeCtx;
   let closedStreak = 0;
   let audioCtx;
+  let lastNoFaceWarn = 0;
 
   async function init() {
     document.getElementById("start-btn").disabled = true;
-    document.getElementById("status").innerText = "Loading model…";
+    const statusEl = document.getElementById("status");
+    statusEl.innerText = "Loading face detector…";
 
-    const modelURL = MODEL_URL + "model.json";
-    const metadataURL = MODEL_URL + "metadata.json";
+    // 1. Load the face landmark model (runs locally in-browser, no data leaves the device)
+    const filesetResolver = await FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+    );
+    faceLandmarker = await FaceLandmarker.createFromOptions(filesetResolver, {
+      baseOptions: {
+        modelAssetPath:
+          "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+        delegate: "GPU"
+      },
+      runningMode: "VIDEO",
+      numFaces: 1
+    });
 
-    model = await tmImage.load(modelURL, metadataURL);
+    // 2. Load your Teachable Machine model
+    statusEl.innerText = "Loading your Teachable Machine model…";
+    model = await tmImage.load(MODEL_URL + "model.json", MODEL_URL + "metadata.json");
     maxPredictions = model.getTotalClasses();
-
-    const flip = true;
-    webcam = new tmImage.Webcam(320, 320, flip);
-    await webcam.setup();
-    await webcam.play();
-    window.requestAnimationFrame(loop);
-
-    document.getElementById("webcam-container").innerHTML = "";
-    document.getElementById("webcam-container").appendChild(webcam.canvas);
 
     labelContainer = document.getElementById("label-container");
     labelContainer.innerHTML = "";
@@ -121,30 +173,64 @@
       labelContainer.appendChild(row);
     }
 
-    document.getElementById("status").innerText = "Monitoring…";
+    // 3. Start the raw webcam feed ourselves (so we can pass real frames to MediaPipe)
+    statusEl.innerText = "Requesting camera…";
+    video = document.getElementById("video");
+    eyeCanvas = document.getElementById("eye-crop-canvas");
+    eyeCtx = eyeCanvas.getContext("2d");
+
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 320, height: 240 } });
+    video.srcObject = stream;
+    await video.play();
+
+    statusEl.innerText = "Monitoring…";
+    requestAnimationFrame(loop);
   }
 
-  async function loop() {
-    webcam.update();
-    await predict();
-    window.requestAnimationFrame(loop);
+  function loop() {
+    detectAndPredict();
+    requestAnimationFrame(loop);
   }
 
-  async function predict() {
-    const prediction = await model.predict(webcam.canvas);
+  async function detectAndPredict() {
+    if (video.readyState < 2) return; // video not ready yet
+
+    const results = faceLandmarker.detectForVideo(video, performance.now());
+    const statusEl = document.getElementById("status");
+
+    if (!results.faceLandmarks || results.faceLandmarks.length === 0) {
+      // No face found this frame — don't count it either way, just let the user know
+      if (performance.now() - lastNoFaceWarn > 1000) {
+        statusEl.innerText = "No face detected — face the camera";
+        statusEl.classList.remove("alert");
+        lastNoFaceWarn = performance.now();
+      }
+      return;
+    }
+
+    const landmarks = results.faceLandmarks[0];
+    const box = getEyeBoundingBox(landmarks, video.videoWidth, video.videoHeight);
+
+    // Draw the cropped eye region (mirrored to match the visible video) into the small canvas
+    eyeCtx.save();
+    eyeCtx.scale(-1, 1);
+    eyeCtx.drawImage(
+      video,
+      box.x, box.y, box.width, box.height,
+      -eyeCanvas.width, 0, eyeCanvas.width, eyeCanvas.height
+    );
+    eyeCtx.restore();
+
+    // Feed ONLY the cropped eye region into your Teachable Machine model
+    const prediction = await model.predict(eyeCanvas);
     let closedConfidence = 0;
 
     for (let i = 0; i < maxPredictions; i++) {
       const p = prediction[i];
       const row = labelContainer.childNodes[i];
       row.innerText = `${p.className}: ${(p.probability * 100).toFixed(1)}%`;
-
-      if (p.className === CLOSED_CLASS_NAME) {
-        closedConfidence = p.probability;
-      }
+      if (p.className === CLOSED_CLASS_NAME) closedConfidence = p.probability;
     }
-
-    const statusEl = document.getElementById("status");
 
     if (closedConfidence >= CONFIDENCE_THRESHOLD) {
       closedStreak++;
@@ -161,8 +247,35 @@
     }
   }
 
+  // Turns the eye landmark points into a padded pixel bounding box on the raw video frame
+  function getEyeBoundingBox(landmarks, videoWidth, videoHeight) {
+    let minX = 1, minY = 1, maxX = 0, maxY = 0;
+    for (const idx of ALL_EYE_POINTS) {
+      const pt = landmarks[idx];
+      if (pt.x < minX) minX = pt.x;
+      if (pt.y < minY) minY = pt.y;
+      if (pt.x > maxX) maxX = pt.x;
+      if (pt.y > maxY) maxY = pt.y;
+    }
+
+    // Convert normalized (0-1) coordinates to actual pixel coordinates
+    let x = minX * videoWidth;
+    let y = minY * videoHeight;
+    let width = (maxX - minX) * videoWidth;
+    let height = (maxY - minY) * videoHeight;
+
+    // Add padding around the tight eye box so eyelids/brows have a little room
+    const padX = width * CROP_PADDING_FACTOR;
+    const padY = height * CROP_PADDING_FACTOR;
+    x = Math.max(0, x - padX);
+    y = Math.max(0, y - padY);
+    width = Math.min(videoWidth - x, width + padX * 2);
+    height = Math.min(videoHeight - y, height + padY * 2);
+
+    return { x, y, width, height };
+  }
+
   function triggerAlert() {
-    // Beep using the Web Audio API (no external sound file needed)
     if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     const osc = audioCtx.createOscillator();
     const gain = audioCtx.createGain();
@@ -173,8 +286,6 @@
     gain.connect(audioCtx.destination);
     osc.start();
     osc.stop(audioCtx.currentTime + 0.3);
-
-    // Also try the browser vibration API (works on some mobile browsers)
     if (navigator.vibrate) navigator.vibrate([200, 100, 200]);
   }
 
