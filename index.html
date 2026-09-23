@@ -3,6 +3,8 @@
 <head>
 <meta charset="UTF-8" />
 <title>Driver Drowsiness Alert</title>
+<link rel="preconnect" href="https://cdn.jsdelivr.net">
+<link rel="preconnect" href="https://storage.googleapis.com">
 <style>
   body {
     font-family: system-ui, sans-serif;
@@ -92,7 +94,7 @@
 
 <div class="video-row">
   <div>
-    <div class="video-box"><video id="video" width="320" height="240" autoplay playsinline muted></video></div>
+    <div class="video-box"><video id="video" width="256" height="192" autoplay playsinline muted></video></div>
     <div class="box-label">Full camera view</div>
   </div>
   <div>
@@ -127,6 +129,14 @@
 
   // How much extra space to include around the detected eye area (bigger = looser crop)
   const CROP_PADDING_FACTOR = 0.6;
+
+  // Try "GPU" first; on some laptops (especially integrated graphics) "CPU" actually
+  // starts up faster and runs just as fast for a model this small — test both.
+  const DELEGATE = "GPU";
+
+  // Smaller capture resolution = fewer pixels for the face detector to process every cycle
+  const CAPTURE_WIDTH = 256;
+  const CAPTURE_HEIGHT = 192;
   // ==================================
 
   // Landmark indices around the left and right eyes (MediaPipe's 478-point face mesh)
@@ -154,7 +164,7 @@
       baseOptions: {
         modelAssetPath:
           "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
-        delegate: "GPU"
+        delegate: DELEGATE
       },
       runningMode: "VIDEO",
       numFaces: 1
@@ -179,21 +189,29 @@
     eyeCanvas = document.getElementById("eye-crop-canvas");
     eyeCtx = eyeCanvas.getContext("2d");
 
-    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 320, height: 240 } });
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: CAPTURE_WIDTH, height: CAPTURE_HEIGHT } });
     video.srcObject = stream;
     await video.play();
 
     statusEl.innerText = "Monitoring…";
-    requestAnimationFrame(loop);
+    // Run detection ~5 times per second instead of on every animation frame (~60/sec).
+    // Drowsiness detection doesn't need more than this, and it massively cuts CPU/GPU load.
+    setInterval(detectAndPredict, 200);
   }
 
-  function loop() {
-    detectAndPredict();
-    requestAnimationFrame(loop);
-  }
-
+  let busy = false;
   async function detectAndPredict() {
     if (video.readyState < 2) return; // video not ready yet
+    if (busy) return; // skip this tick if the previous one hasn't finished yet
+    busy = true;
+    try {
+      await runDetection();
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function runDetection() {
 
     const results = faceLandmarker.detectForVideo(video, performance.now());
     const statusEl = document.getElementById("status");
