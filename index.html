@@ -32,7 +32,7 @@
     background: #000;
   }
   #video {
-    transform: scaleX(-1); /* mirror so it feels natural, like a selfie cam */
+    transform: scaleX(-1);
     display: block;
   }
   #eye-crop-canvas {
@@ -98,7 +98,7 @@
     <div class="box-label">Full camera view</div>
   </div>
   <div>
-    <div class="video-box"><canvas id="eye-crop-canvas" width="300" height="90"></canvas></div>
+    <div class="video-box"><canvas id="eye-crop-canvas" width="200" height="100"></canvas></div>
     <div class="box-label">Cropped eye region (what the model sees)</div>
   </div>
 </div>
@@ -113,33 +113,23 @@
   Machine model using similarly cropped eye images for best accuracy.
 </div>
 
-<!-- Teachable Machine (TensorFlow.js) for the trained image classifier -->
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@1.3.1/dist/tf.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@teachablemachine/image@0.8/dist/teachablemachine-image.min.js"></script>
 
 <script type="module">
-  // MediaPipe Face Landmarker — used only to locate the eyes, not to classify anything
   import { FaceLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
 
   // ====== CONFIG — EDIT THESE ======
-  const MODEL_URL = "https://teachablemachine.withgoogle.com/models/L5pI9jus3/";
-  const CLOSED_CLASS_NAME = "Close eye";
+  const MODEL_URL = "https://teachablemachine.withgoogle.com/models/XXXXXXXXX/";
+  const CLOSED_CLASS_NAME = "Closed";
   const CONFIDENCE_THRESHOLD = 0.75;
   const CONSECUTIVE_FRAMES_NEEDED = 15;
-
-  // How much extra space to include around the detected eye area (bigger = looser crop)
-  const CROP_PADDING_FACTOR = 0.9;
-
-  // Try "GPU" first; on some laptops (especially integrated graphics) "CPU" actually
-  // starts up faster and runs just as fast for a model this small — test both.
+  const CROP_PADDING_FACTOR = 0.6;
   const DELEGATE = "GPU";
-
-  // Smaller capture resolution = fewer pixels for the face detector to process every cycle
   const CAPTURE_WIDTH = 256;
   const CAPTURE_HEIGHT = 192;
   // ==================================
 
-  // Landmark indices around the left and right eyes (MediaPipe's 478-point face mesh)
   const LEFT_EYE = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246];
   const RIGHT_EYE = [263, 249, 390, 373, 374, 380, 381, 382, 362, 398, 384, 385, 386, 387, 388, 466];
   const ALL_EYE_POINTS = LEFT_EYE.concat(RIGHT_EYE);
@@ -150,13 +140,14 @@
   let closedStreak = 0;
   let audioCtx;
   let lastNoFaceWarn = 0;
+  let recentConfidences = []; // rolling window used to smooth out frame-to-frame jitter
+  const SMOOTHING_WINDOW = 4;
 
   async function init() {
     document.getElementById("start-btn").disabled = true;
     const statusEl = document.getElementById("status");
     statusEl.innerText = "Loading face detector…";
 
-    // 1. Load the face landmark model (runs locally in-browser, no data leaves the device)
     const filesetResolver = await FilesetResolver.forVisionTasks(
       "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
     );
@@ -170,7 +161,6 @@
       numFaces: 1
     });
 
-    // 2. Load your Teachable Machine model
     statusEl.innerText = "Loading your Teachable Machine model…";
     model = await tmImage.load(MODEL_URL + "model.json", MODEL_URL + "metadata.json");
     maxPredictions = model.getTotalClasses();
@@ -183,7 +173,6 @@
       labelContainer.appendChild(row);
     }
 
-    // 3. Start the raw webcam feed ourselves (so we can pass real frames to MediaPipe)
     statusEl.innerText = "Requesting camera…";
     video = document.getElementById("video");
     eyeCanvas = document.getElementById("eye-crop-canvas");
@@ -194,15 +183,13 @@
     await video.play();
 
     statusEl.innerText = "Monitoring…";
-    // Run detection ~5 times per second instead of on every animation frame (~60/sec).
-    // Drowsiness detection doesn't need more than this, and it massively cuts CPU/GPU load.
     setInterval(detectAndPredict, 200);
   }
 
   let busy = false;
   async function detectAndPredict() {
-    if (video.readyState < 2) return; // video not ready yet
-    if (busy) return; // skip this tick if the previous one hasn't finished yet
+    if (video.readyState < 2) return;
+    if (busy) return;
     busy = true;
     try {
       await runDetection();
@@ -212,12 +199,10 @@
   }
 
   async function runDetection() {
-
     const results = faceLandmarker.detectForVideo(video, performance.now());
     const statusEl = document.getElementById("status");
 
     if (!results.faceLandmarks || results.faceLandmarks.length === 0) {
-      // No face found this frame — don't count it either way, just let the user know
       if (performance.now() - lastNoFaceWarn > 1000) {
         statusEl.innerText = "No face detected — face the camera";
         statusEl.classList.remove("alert");
@@ -229,7 +214,6 @@
     const landmarks = results.faceLandmarks[0];
     const box = getEyeBoundingBox(landmarks, video.videoWidth, video.videoHeight);
 
-    // Draw the cropped eye region (mirrored to match the visible video) into the small canvas
     eyeCtx.save();
     eyeCtx.scale(-1, 1);
     eyeCtx.drawImage(
@@ -239,7 +223,6 @@
     );
     eyeCtx.restore();
 
-    // Feed ONLY the cropped eye region into your Teachable Machine model
     const prediction = await model.predict(eyeCanvas);
     let closedConfidence = 0;
 
@@ -250,7 +233,11 @@
       if (p.className === CLOSED_CLASS_NAME) closedConfidence = p.probability;
     }
 
-    if (closedConfidence >= CONFIDENCE_THRESHOLD) {
+    recentConfidences.push(closedConfidence);
+    if (recentConfidences.length > SMOOTHING_WINDOW) recentConfidences.shift();
+    const smoothedConfidence = recentConfidences.reduce((a, b) => a + b, 0) / recentConfidences.length;
+
+    if (smoothedConfidence >= CONFIDENCE_THRESHOLD) {
       closedStreak++;
     } else {
       closedStreak = 0;
@@ -265,7 +252,6 @@
     }
   }
 
-  // Turns the eye landmark points into a padded pixel bounding box on the raw video frame
   function getEyeBoundingBox(landmarks, videoWidth, videoHeight) {
     let minX = 1, minY = 1, maxX = 0, maxY = 0;
     for (const idx of ALL_EYE_POINTS) {
@@ -276,19 +262,32 @@
       if (pt.y > maxY) maxY = pt.y;
     }
 
-    // Convert normalized (0-1) coordinates to actual pixel coordinates
     let x = minX * videoWidth;
     let y = minY * videoHeight;
     let width = (maxX - minX) * videoWidth;
     let height = (maxY - minY) * videoHeight;
 
-    // Add padding around the tight eye box so eyelids/brows have a little room
     const padX = width * CROP_PADDING_FACTOR;
     const padY = height * CROP_PADDING_FACTOR;
-    x = Math.max(0, x - padX);
-    y = Math.max(0, y - padY);
-    width = Math.min(videoWidth - x, width + padX * 2);
-    height = Math.min(videoHeight - y, height + padY * 2);
+    x -= padX; y -= padY;
+    width += padX * 2; height += padY * 2;
+
+    const targetRatio = eyeCanvas.width / eyeCanvas.height;
+    const currentRatio = width / height;
+    if (currentRatio < targetRatio) {
+      const newWidth = height * targetRatio;
+      x -= (newWidth - width) / 2;
+      width = newWidth;
+    } else {
+      const newHeight = width / targetRatio;
+      y -= (newHeight - height) / 2;
+      height = newHeight;
+    }
+
+    x = Math.max(0, Math.min(x, videoWidth - width));
+    y = Math.max(0, Math.min(y, videoHeight - height));
+    width = Math.min(width, videoWidth);
+    height = Math.min(height, videoHeight);
 
     return { x, y, width, height };
   }
