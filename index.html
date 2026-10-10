@@ -75,10 +75,10 @@
     margin-top: 10px;
   }
   button:hover { background: #f4a259; }
+  <!-- =====  ===== -->
    button:disabled { opacity: 0.5; cursor: not-allowed; }
-   <!-- =====  ===== -->
   #calib-msg { margin-top: 8px; font-size: 0.95rem; color: #fbbf24; min-height: 1.2em; text-align: center; }
-  #score-line { margin-top: 6px; font-size: 0.85rem; color: #dad7cd; }
+  #score-line { margin-top: 6px; font-size: 0.85rem; color: #94a3b8; }
    <!-- =====  ===== -->
   #config {
     font-size: 0.8rem;
@@ -169,26 +169,46 @@
   async function init() {
     document.getElementById("start-btn").disabled = true;
     const statusEl = document.getElementById("status");
-    statusEl.innerText = "Loading face detector…";
 
-    // 1. Load the face landmark model (runs locally in-browser, no data leaves the device)
-    const filesetResolver = await FilesetResolver.forVisionTasks(
-      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
-    );
-    faceLandmarker = await FaceLandmarker.createFromOptions(filesetResolver, {
-      baseOptions: {
-        modelAssetPath:
-          "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
-        delegate: DELEGATE
-      },
-      runningMode: "VIDEO",
-      numFaces: 1
-    });
+    // ===== ★ LATEST CHANGE: everything below now loads IN PARALLEL (before, each step waited for the previous one) =====
+    statusEl.innerText = "Loading models and starting camera…";
+    video = document.getElementById("video");
+    eyeCanvas = document.getElementById("eye-crop-canvas");
+    eyeCtx = eyeCanvas.getContext("2d");
+    eyeCtx.imageSmoothingEnabled = true;
+    eyeCtx.imageSmoothingQuality = "high";
 
-    // 2. Load your Teachable Machine model
-    statusEl.innerText = "Loading your Teachable Machine model…";
-    model = await tmImage.load(MODEL_URL + "model.json", MODEL_URL + "metadata.json");
-    maxPredictions = model.getTotalClasses();
+    // 1. Face landmark model (runs locally in-browser, no data leaves the device)
+    const loadFace = (async () => {
+      const filesetResolver = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+      );
+      faceLandmarker = await FaceLandmarker.createFromOptions(filesetResolver, {
+        baseOptions: {
+          modelAssetPath:
+            "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+          delegate: DELEGATE
+        },
+        runningMode: "VIDEO",
+        numFaces: 1
+      });
+    })();
+
+    // 2. Your Teachable Machine model
+    const loadTM = (async () => {
+      model = await tmImage.load(MODEL_URL + "model.json", MODEL_URL + "metadata.json");
+      maxPredictions = model.getTotalClasses();
+    })();
+
+    // 3. The raw webcam feed (so we can pass real frames to MediaPipe)
+    const startCam = (async () => {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { width: CAPTURE_WIDTH, height: CAPTURE_HEIGHT } });
+      video.srcObject = stream;
+      await video.play();
+    })();
+
+    await Promise.all([loadFace, loadTM, startCam]);
+    // ===== END ★ LATEST CHANGE =====
 
     labelContainer = document.getElementById("label-container");
     labelContainer.innerHTML = "";
@@ -197,18 +217,6 @@
       row.className = "label-row";
       labelContainer.appendChild(row);
     }
-
-    // 3. Start the raw webcam feed ourselves (so we can pass real frames to MediaPipe)
-    statusEl.innerText = "Requesting camera…";
-    video = document.getElementById("video");
-    eyeCanvas = document.getElementById("eye-crop-canvas");
-    eyeCtx = eyeCanvas.getContext("2d");
-    eyeCtx.imageSmoothingEnabled = true;
-    eyeCtx.imageSmoothingQuality = "high";
-
-    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: CAPTURE_WIDTH, height: CAPTURE_HEIGHT } });
-    video.srcObject = stream;
-    await video.play();
 
     document.getElementById("calibrate-btn").disabled = false; // NEW
     statusEl.innerText = "Monitoring…";
@@ -268,6 +276,7 @@
       if (p.className === CLOSED_CLASS_NAME) closedConfidence = p.probability;
     }
 
+    // Smooth out single-frame noise by averaging over the last few readings
     // ===== NEW: during calibration, just record the raw closed-eye score and stop here =====
     const scoreEl = document.getElementById("score-line");
     if (calibrating) {
@@ -277,7 +286,6 @@
     }
     // ===== END NEW =====
 
-    // Smooth out single-frame noise by averaging over the last few readings
     recentConfidences.push(closedConfidence);
     if (recentConfidences.length > SMOOTHING_WINDOW) recentConfidences.shift();
     const smoothedConfidence = recentConfidences.reduce((a, b) => a + b, 0) / recentConfidences.length;
@@ -410,7 +418,13 @@
   document.getElementById("calibrate-btn").addEventListener("click", runCalibration);
   // ===== END NEW =====
 
-  document.getElementById("start-btn").addEventListener("click", init);
+  // ★ LATEST CHANGE: if anything fails (camera blocked, wrong MODEL_URL, etc.) show the reason instead of hanging
+  document.getElementById("start-btn").addEventListener("click", () => {
+    init().catch((err) => {
+      document.getElementById("status").innerText = "Error: " + (err && err.message ? err.message : err);
+      document.getElementById("start-btn").disabled = false;
+    });
+  });
 </script>
 
 </body>
